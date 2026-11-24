@@ -1,7 +1,10 @@
 // pump-fun-sprint-01 — momentum paper-trading bot for agent-fun/replay/v2.
 //
 // Strategy (simple, deterministic, no randomness, no wall clock):
-//   * Watch every mint's mark price (virtual quote / virtual token reserves).
+//   * Watch every mint's price from the batch events (CreateEvent /
+//     TradeEvent carry the post-trade virtual reserves; price = virtual
+//     quote / virtual token). The harness only sends marks for mints we
+//     already hold, so events are the only way to discover new coins.
 //   * BUY a mint once its price is up >= 6% from the first price we saw for
 //     it, it has seen >= 0.2 SOL of buy volume, and we have a free slot.
 //     Size is 0.1 SOL per coin, capped at the protocol's max order size
@@ -41,6 +44,7 @@ type CoinStat = {
   lastPrice: number;
   buyVolume: bigint;
   realQuote: bigint;
+  complete: boolean;
 };
 
 type HeldInfo = {
@@ -48,9 +52,18 @@ type HeldInfo = {
   peakGain: number;
 };
 
+type PendingOrder = {
+  mint: string;
+  side: string;
+  quote: bigint; // buy quote_lamports (0n for sells)
+};
+
 const coins = new Map<string, CoinStat>();
 const held = new Map<string, HeldInfo>();
 const cooldownUntil = new Map<string, number>();
+// Orders sent but not yet resolved by a fill: they still commit a slot
+// and their quote lamports, because fills land latency_slots later.
+const pending = new Map<string, PendingOrder>();
 
 let maxOpenPositions = 5;
 let maxOrderBps = 100;
@@ -97,8 +110,53 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
   const seq = msg.seq as number;
   const orders: any[] = [];
 
-  // --- learn prices from the marks (first, so events in the same batch
-  // can already credit buy volume to a coin we just met) ---
+  // --- resolve pending orders from this batch's fills ---
+  const fills = Array.isArray(msg.fills) ? msg.fills : [];
+  for (const f of fills) {
+    if (f && typeof f.client_id === "string") pending.delete(f.client_id);
+  }
+
+  // --- learn prices from this batch's events ---
+  // The harness only sends marks for mints we hold (or have pending), so
+  // price discovery for the whole universe comes from the events:
+  // CreateEvent/TradeEvent both carry the post-event virtual reserves,
+  // and price = virtual quote reserves / virtual token reserves.
+  const events = Array.isArray(msg.events) ? msg.events : [];
+  for (const ev of events) {
+    if (!ev || typeof ev.mint !== "string") continue;
+    if (ev.event === "CompleteEvent") {
+      const stat = coins.get(ev.mint);
+      if (stat) stat.complete = true;
+      continue;
+    }
+    if (ev.event !== "CreateEvent" && ev.event !== "TradeEvent") continue;
+    const p = priceOf(ev.virtual_quote_reserves, ev.virtual_token_reserves);
+    if (p <= 0) continue;
+    let stat = coins.get(ev.mint);
+    if (!stat) {
+      stat = {
+        firstPrice: p,
+        firstBatch: batchCount,
+        lastPrice: p,
+        buyVolume: 0n,
+        realQuote: 0n,
+        complete: false,
+      };
+      coins.set(ev.mint, stat);
+    } else {
+      stat.lastPrice = p;
+    }
+    if (ev.event === "TradeEvent") {
+      if (typeof ev.real_quote_reserves === "string") {
+        stat.realQuote = BigInt(ev.real_quote_reserves);
+      }
+      if (ev.is_buy === true && typeof ev.sol_amount === "string") {
+        stat.buyVolume += BigInt(ev.sol_amount);
+      }
+    }
+  }
+
+  // --- refine held mints from the marks (authoritative latest reserves) ---
   const marks = Array.isArray(msg.marks) ? msg.marks : [];
   const markPrice = new Map<string, number>();
   for (const m of marks) {
@@ -122,19 +180,8 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
           typeof m.real_quote_reserves === "string"
             ? BigInt(m.real_quote_reserves)
             : 0n,
+        complete: false,
       });
-    }
-  }
-
-  // --- learn from this batch's events ---
-  const events = Array.isArray(msg.events) ? msg.events : [];
-  for (const ev of events) {
-    if (!ev || typeof ev.mint !== "string") continue;
-    if (ev.event === "TradeEvent" && ev.is_buy === true) {
-      const stat = coins.get(ev.mint);
-      if (stat && typeof ev.sol_amount === "string") {
-        stat.buyVolume += BigInt(ev.sol_amount);
-      }
     }
   }
 
@@ -164,6 +211,15 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
   // --- exits: check every held position against its mark ---
   let plannedSells = 0;
   for (const [mint, pos] of positions) {
+    // A sell for this mint is already in flight: wait for its fill.
+    let sellPending = false;
+    for (const o of pending.values()) {
+      if (o.side === "sell" && o.mint === mint) {
+        sellPending = true;
+        break;
+      }
+    }
+    if (sellPending) continue;
     const price = markPrice.get(mint) ?? coins.get(mint)?.lastPrice ?? 0;
     if (price <= 0 || pos.tokens <= 0n || pos.cost <= 0n) continue;
     const avgCost = Number(pos.cost) / Number(pos.tokens);
@@ -192,13 +248,15 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
     }
     if (reason === "") continue;
     if (orders.length >= maxOrdersPerBatch) break;
+    const sellId = nextClientId("s");
     orders.push({
       side: "sell",
-      client_id: nextClientId("s"),
+      client_id: sellId,
       mint,
       token_amount: pos.tokens.toString(),
       max_slippage_bps: MAX_SLIPPAGE_BPS,
     });
+    pending.set(sellId, { mint, side: "sell", quote: 0n });
     sellCount += 1;
     plannedSells += 1;
     held.delete(mint);
@@ -207,12 +265,27 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
   }
 
   // --- entries: strongest momentum first, deterministic order ---
-  const freeSlots =
-    maxOpenPositions - (positions.size - plannedSells);
+  // Committed slots = positions on the books + buys still in flight
+  // (fills land latency_slots later, so they are not in the account yet).
+  const pendingBuyMints = new Set<string>();
+  let pendingBuyQuote = 0n;
+  for (const o of pending.values()) {
+    if (o.side === "buy") {
+      pendingBuyMints.add(o.mint);
+      pendingBuyQuote += o.quote;
+    }
+  }
+  let committed = positions.size - plannedSells;
+  for (const mint of pendingBuyMints) {
+    if (!positions.has(mint)) committed += 1;
+  }
+  const freeSlots = maxOpenPositions - committed;
   if (freeSlots > 0) {
     const candidates: { mint: string; momentum: number; size: bigint }[] = [];
     for (const [mint, stat] of coins) {
+      if (stat.complete) continue;
       if (positions.has(mint)) continue;
+      if (pendingBuyMints.has(mint)) continue;
       if (held.has(mint)) continue;
       const cool = cooldownUntil.get(mint) ?? 0;
       if (currentSlot < cool) continue;
@@ -225,30 +298,30 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
       const cap = (stat.realQuote * BigInt(maxOrderBps)) / 10000n;
       const size = BUY_LAMPORTS < cap ? BUY_LAMPORTS : cap;
       if (size < MIN_BUY_LAMPORTS) continue;
-      if (cash < size + CASH_RESERVE_LAMPORTS) continue;
       candidates.push({ mint, momentum, size });
     }
     candidates.sort(
       (a, b) =>
         b.momentum - a.momentum || (a.mint < b.mint ? -1 : 1),
     );
+    // Cash the account shows minus buys already in flight.
+    let spendable = cash - pendingBuyQuote;
     for (const c of candidates) {
       if (orders.length >= maxOrdersPerBatch) break;
-      // Count buys already queued this batch against the position cap.
       const queuedBuys = orders.filter((o) => o.side === "buy").length;
-      if (positions.size - plannedSells + queuedBuys >= maxOpenPositions) {
-        break;
-      }
-      if (cash < c.size + CASH_RESERVE_LAMPORTS) continue;
+      if (committed + queuedBuys >= maxOpenPositions) break;
+      if (spendable < c.size + CASH_RESERVE_LAMPORTS) continue;
+      const clientId = nextClientId("b");
       orders.push({
         side: "buy",
-        client_id: nextClientId("b"),
+        client_id: clientId,
         mint: c.mint,
         quote_lamports: c.size.toString(),
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
+      pending.set(clientId, { mint: c.mint, side: "buy", quote: c.size });
       buyCount += 1;
-      cash -= c.size;
+      spendable -= c.size;
       held.set(c.mint, { buySlot: currentSlot, peakGain: 0 });
       process.stderr.write(
         `buy ${c.mint} momentum=${c.momentum.toFixed(4)} size=${c.size}\n`,
