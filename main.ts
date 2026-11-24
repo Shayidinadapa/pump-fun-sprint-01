@@ -5,16 +5,16 @@
 //     TradeEvent carry the post-trade virtual reserves; price = virtual
 //     quote / virtual token). The harness only sends marks for mints we
 //     already hold, so events are the only way to discover new coins.
-//   * BUY a mint once its price is up >= 10% from the first price we saw
-//     for it, it has seen >= 0.2 SOL of buy volume, and we have a free
-//     slot — but only if its CreateEvent proves it is in the replay
-//     universe (SOL-quoted, not mayhem, not cashback, sampled), so no
-//     order is wasted on a mint the harness would reject.
-//     Size is 0.1 SOL per coin, capped at the protocol's max order size
-//     (max_order_bps_of_real_reserve of the real quote reserves).
-//   * SELL the whole position on take-profit (+50%), stop-loss (-10%),
-//     a trailing stop (give back 12 points after a +25% peak), or a stale
-//     exit (held > ~2h of slots and still under +5%).
+//   * BUY a mint in its first minutes (within 40 batches of first sight),
+//     once it has seen >= 0.1 SOL of buy volume and is not already
+//     dumping (price >= 95% of first-seen). Only if its CreateEvent proves
+//     it is in the replay universe (SOL-quoted, not mayhem, not cashback,
+//     sampled), so no order is wasted on a mint the harness would reject.
+//     Size is 0.05 SOL per coin, capped at 80% of the protocol's max
+//     order size (max_order_bps_of_real_reserve of real quote reserves).
+//   * SELL the whole position on take-profit (+30%), stop-loss (-15%),
+//     a trailing stop (give back 10 points after a +20% peak), or a stale
+//     exit (held > ~30 min of slots and still under +5%).
 //   * At most 5 open positions; never re-buy a mint within 2000 slots of
 //     selling it. Every decision comes only from the harness messages, so
 //     two runs on the same window produce byte-identical action logs.
@@ -27,20 +27,23 @@ import { createHash } from "node:crypto";
 import * as readline from "node:readline";
 
 // ---- tunables (all in lamports unless noted; 1 SOL = 1_000_000_000) ----
-const BUY_LAMPORTS = 100_000_000n; // 0.1 SOL per coin
+const BUY_LAMPORTS = 50_000_000n; // 0.05 SOL per coin
 const MIN_BUY_LAMPORTS = 10_000_000n; // 0.01 SOL: the round-trip bar
 const CASH_RESERVE_LAMPORTS = 1_000_000n; // keep a little cash for fees
-const ENTRY_GAIN = 1.1; // price up 10% vs first-seen price
-const MIN_BATCHES_SINCE_FIRST_SEEN = 2;
-const MIN_BUY_VOLUME_LAMPORTS = 200_000_000n; // 0.2 SOL of buys seen
-const TAKE_PROFIT = 0.5; // +50% vs average cost: let runners run
-const STOP_LOSS = -0.1; // -10% vs average cost
-const TRAIL_TRIGGER = 0.25; // trailing stop arms at +25%
-const TRAIL_GIVEBACK = 0.12; // sell after giving back 12 points from peak
-const STALE_SLOTS = 20000; // ~2h of slots
+const MIN_BUY_VOLUME_LAMPORTS = 100_000_000n; // 0.1 SOL of buys seen
+const MAX_BATCHES_SINCE_FIRST_SEEN = 40; // only buy coins in their first minutes
+const MIN_EARLY_PRICE = 0.95; // do not buy a coin already dumping 5%+
+const TAKE_PROFIT = 0.3; // +30% vs average cost
+const STOP_LOSS = -0.15; // -15% vs average cost
+const TRAIL_TRIGGER = 0.2; // trailing stop arms at +20%
+const TRAIL_GIVEBACK = 0.1; // sell after giving back 10 points from peak
+const STALE_SLOTS = 4500; // ~30 min of slots: rotate fast
 const STALE_GAIN = 0.05; // stale exit unless up at least +5%
 const COOLDOWN_SLOTS = 2000; // wait before re-buying a sold mint
 const MAX_SLIPPAGE_BPS = 200;
+const CAP_SAFETY_NUM = 80; // buy at most 80% of the protocol size cap:
+const CAP_SAFETY_DEN = 100; // the harness caps on decision-time reserves,
+// which run below the reserves we last saw once our own fills moved them.
 const DEFAULT_PUBKEY = "11111111111111111111111111111111";
 
 type CoinStat = {
@@ -309,7 +312,7 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
     process.stderr.write(`sell ${mint} ${reason} gain=${gain.toFixed(4)}\n`);
   }
 
-  // --- entries: strongest momentum first, deterministic order ---
+  // --- entries: earliest first, deterministic order ---
   // Committed slots = positions on the books + buys still in flight
   // (fills land latency_slots later, so they are not in the account yet).
   const pendingBuyMints = new Set<string>();
@@ -326,7 +329,7 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
   }
   const freeSlots = maxOpenPositions - committed;
   if (freeSlots > 0) {
-    const candidates: { mint: string; momentum: number; size: bigint }[] = [];
+    const candidates: { mint: string; size: bigint }[] = [];
     for (const [mint, stat] of coins) {
       if (!stat.inUniverse) continue;
       if (stat.complete) continue;
@@ -335,21 +338,24 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
       if (held.has(mint)) continue;
       const cool = cooldownUntil.get(mint) ?? 0;
       if (currentSlot < cool) continue;
-      if (batchCount - stat.firstBatch < MIN_BATCHES_SINCE_FIRST_SEEN) {
-        continue;
-      }
+      const age = batchCount - stat.firstBatch;
+      if (age > MAX_BATCHES_SINCE_FIRST_SEEN) continue;
       if (stat.buyVolume < MIN_BUY_VOLUME_LAMPORTS) continue;
-      const momentum = stat.lastPrice / stat.firstPrice;
-      if (momentum < ENTRY_GAIN) continue;
-      const cap = (stat.realQuote * BigInt(maxOrderBps)) / 10000n;
+      if (stat.lastPrice < stat.firstPrice * MIN_EARLY_PRICE) continue;
+      const cap =
+        ((stat.realQuote * BigInt(maxOrderBps)) / 10000n) *
+          BigInt(CAP_SAFETY_NUM) /
+        BigInt(CAP_SAFETY_DEN);
       const size = BUY_LAMPORTS < cap ? BUY_LAMPORTS : cap;
       if (size < MIN_BUY_LAMPORTS) continue;
-      candidates.push({ mint, momentum, size });
+      candidates.push({ mint, size });
     }
-    candidates.sort(
-      (a, b) =>
-        b.momentum - a.momentum || (a.mint < b.mint ? -1 : 1),
-    );
+    // Earliest-seen first; mint id breaks ties deterministically.
+    candidates.sort((a, b) => {
+      const fa = coins.get(a.mint)!.firstBatch;
+      const fb = coins.get(b.mint)!.firstBatch;
+      return fa - fb || (a.mint < b.mint ? -1 : 1);
+    });
     // Cash the account shows minus buys already in flight.
     let spendable = cash - pendingBuyQuote;
     for (const c of candidates) {
@@ -370,7 +376,7 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
       spendable -= c.size;
       held.set(c.mint, { buySlot: currentSlot, peakGain: 0 });
       process.stderr.write(
-        `buy ${c.mint} momentum=${c.momentum.toFixed(4)} size=${c.size}\n`,
+        `buy ${c.mint} age=${batchCount - coins.get(c.mint)!.firstBatch} size=${c.size}\n`,
       );
     }
   }
