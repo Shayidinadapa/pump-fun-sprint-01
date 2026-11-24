@@ -5,12 +5,15 @@
 //     TradeEvent carry the post-trade virtual reserves; price = virtual
 //     quote / virtual token). The harness only sends marks for mints we
 //     already hold, so events are the only way to discover new coins.
-//   * BUY a mint once its price is up >= 6% from the first price we saw for
-//     it, it has seen >= 0.2 SOL of buy volume, and we have a free slot.
+//   * BUY a mint once its price is up >= 10% from the first price we saw
+//     for it, it has seen >= 0.2 SOL of buy volume, and we have a free
+//     slot — but only if its CreateEvent proves it is in the replay
+//     universe (SOL-quoted, not mayhem, not cashback, sampled), so no
+//     order is wasted on a mint the harness would reject.
 //     Size is 0.1 SOL per coin, capped at the protocol's max order size
 //     (max_order_bps_of_real_reserve of the real quote reserves).
-//   * SELL the whole position on take-profit (+35%), stop-loss (-12%),
-//     a trailing stop (give back 10 points after a +20% peak), or a stale
+//   * SELL the whole position on take-profit (+50%), stop-loss (-10%),
+//     a trailing stop (give back 12 points after a +25% peak), or a stale
 //     exit (held > ~2h of slots and still under +5%).
 //   * At most 5 open positions; never re-buy a mint within 2000 slots of
 //     selling it. Every decision comes only from the harness messages, so
@@ -20,23 +23,25 @@
 // stdout: {"type":"reply","seq":<batch seq>,"orders":[...]}.
 // Logs go to stderr only, so stdout stays pure protocol.
 
+import { createHash } from "node:crypto";
 import * as readline from "node:readline";
 
 // ---- tunables (all in lamports unless noted; 1 SOL = 1_000_000_000) ----
 const BUY_LAMPORTS = 100_000_000n; // 0.1 SOL per coin
 const MIN_BUY_LAMPORTS = 10_000_000n; // 0.01 SOL: the round-trip bar
 const CASH_RESERVE_LAMPORTS = 1_000_000n; // keep a little cash for fees
-const ENTRY_GAIN = 1.06; // price up 6% vs first-seen price
+const ENTRY_GAIN = 1.1; // price up 10% vs first-seen price
 const MIN_BATCHES_SINCE_FIRST_SEEN = 2;
 const MIN_BUY_VOLUME_LAMPORTS = 200_000_000n; // 0.2 SOL of buys seen
-const TAKE_PROFIT = 0.35; // +35% vs average cost
-const STOP_LOSS = -0.12; // -12% vs average cost
-const TRAIL_TRIGGER = 0.2; // trailing stop arms at +20%
-const TRAIL_GIVEBACK = 0.1; // sell after giving back 10 points from peak
+const TAKE_PROFIT = 0.5; // +50% vs average cost: let runners run
+const STOP_LOSS = -0.1; // -10% vs average cost
+const TRAIL_TRIGGER = 0.25; // trailing stop arms at +25%
+const TRAIL_GIVEBACK = 0.12; // sell after giving back 12 points from peak
 const STALE_SLOTS = 20000; // ~2h of slots
 const STALE_GAIN = 0.05; // stale exit unless up at least +5%
 const COOLDOWN_SLOTS = 2000; // wait before re-buying a sold mint
 const MAX_SLIPPAGE_BPS = 200;
+const DEFAULT_PUBKEY = "11111111111111111111111111111111";
 
 type CoinStat = {
   firstPrice: number;
@@ -45,6 +50,10 @@ type CoinStat = {
   buyVolume: bigint;
   realQuote: bigint;
   complete: boolean;
+  // True only once we have seen a CreateEvent proving the mint is in the
+  // replay universe (SOL-quoted, not mayhem, not cashback, sampled).
+  // Mints first seen via a trade predate the window and are not tradable.
+  inUniverse: boolean;
 };
 
 type HeldInfo = {
@@ -68,12 +77,23 @@ const pending = new Map<string, PendingOrder>();
 let maxOpenPositions = 5;
 let maxOrderBps = 100;
 let maxOrdersPerBatch = 16;
+let sampleModulus = 16;
+let sampleResidue = 15;
 let cash = 0n;
 let orderCounter = 0;
 let batchCount = 0;
 let buyCount = 0;
 let sellCount = 0;
 let currentSlot = 0;
+
+// sha256 of the mint's UTF-8 base58 text, as a big-endian unsigned integer.
+function mintSampleHash(mint: string): bigint {
+  return BigInt(`0x${createHash("sha256").update(mint, "utf8").digest("hex")}`);
+}
+
+function inSample(mint: string): boolean {
+  return mintSampleHash(mint) % BigInt(sampleModulus) === BigInt(sampleResidue);
+}
 
 function priceOf(virtualQuote: string, virtualToken: string): number {
   const q = Number(virtualQuote);
@@ -102,6 +122,14 @@ function handleHello(msg: any): void {
   if (msg.capital && typeof msg.capital.lamports === "string") {
     cash = BigInt(msg.capital.lamports);
   }
+  if (msg.universe && msg.universe.sample) {
+    if (typeof msg.universe.sample.modulus === "number") {
+      sampleModulus = msg.universe.sample.modulus;
+    }
+    if (typeof msg.universe.sample.residue === "number") {
+      sampleResidue = msg.universe.sample.residue;
+    }
+  }
 }
 
 function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
@@ -113,7 +141,14 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
   // --- resolve pending orders from this batch's fills ---
   const fills = Array.isArray(msg.fills) ? msg.fills : [];
   for (const f of fills) {
-    if (f && typeof f.client_id === "string") pending.delete(f.client_id);
+    if (f && typeof f.client_id === "string") {
+      if (f.status === "rejected" || f.status === "failed") {
+        process.stderr.write(
+          `fill ${f.status} ${f.client_id} ${f.mint} reason=${f.reason}\n`,
+        );
+      }
+      pending.delete(f.client_id);
+    }
   }
 
   // --- learn prices from this batch's events ---
@@ -141,10 +176,19 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
         buyVolume: 0n,
         realQuote: 0n,
         complete: false,
+        inUniverse: false,
       };
       coins.set(ev.mint, stat);
     } else {
       stat.lastPrice = p;
+    }
+    if (ev.event === "CreateEvent") {
+      // Universe membership is decided by create-time facts only.
+      stat.inUniverse =
+        ev.quote_mint === DEFAULT_PUBKEY &&
+        ev.is_mayhem_mode !== true &&
+        ev.is_cashback_enabled !== true &&
+        inSample(ev.mint);
     }
     if (ev.event === "TradeEvent") {
       if (typeof ev.real_quote_reserves === "string") {
@@ -181,6 +225,7 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
             ? BigInt(m.real_quote_reserves)
             : 0n,
         complete: false,
+        inUniverse: false,
       });
     }
   }
@@ -283,6 +328,7 @@ function handleBatch(msg: any): { type: string; seq: number; orders: any[] } {
   if (freeSlots > 0) {
     const candidates: { mint: string; momentum: number; size: bigint }[] = [];
     for (const [mint, stat] of coins) {
+      if (!stat.inUniverse) continue;
       if (stat.complete) continue;
       if (positions.has(mint)) continue;
       if (pendingBuyMints.has(mint)) continue;
